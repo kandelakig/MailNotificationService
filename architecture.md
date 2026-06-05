@@ -24,10 +24,10 @@ External Platform
       |
       | REST
       v
-+-------------+        +---------------+        +----------------+                   +------------------+
-| API Service | -----> |   Database    | <----- | Background     | ----------------> | Email Provider   |
-|             |        | notifications |        | Worker         | render template   +------------------+
-+-------------+        +---------------+        +----------------+ and send email
++--------------+        +---------------+        +----------------+                   +------------------+
+| API Service  | -----> |   Database    | <----- | Background     | ----------------> | Email Provider   |
+| & Dispatcher |        | notifications |        | Worker         | render template   +------------------+
++--------------+        +---------------+        +----------------+ and send email
       |                                               A
       |                                       consume |
       |                                  notification |
@@ -48,7 +48,7 @@ Responsibilities:
 - Persist notification records.
   - Only create new records, never update existing records.
   - Return a failure, preferably `409 Conflict`, if a notification with the requested `id` already exists.
-- Enqueue background work after successful persistence.
+- Create a durable outbox entry in the same database transaction as the notification.
 - Return notification status and filtered notification lists.
 
 Required endpoints:
@@ -57,7 +57,17 @@ Required endpoints:
 - `GET /notifications/{id}`
 - `GET /notifications`
 
-The API service should not send emails directly. It should only create durable work for the worker.
+The API service should not send emails directly or publish queue messages directly. It should only create durable database state.
+
+### Outbox Dispatcher
+
+Responsibilities:
+
+- Read notification IDs from the transactional outbox table.
+- Publish durable queue messages containing only the notification ID.
+- Delete outbox rows only after the queue confirms the message was published.
+
+The dispatcher is intentionally small. The outbox table is the handoff between API writes and queue publishing.
 
 ### Background Worker
 
@@ -100,21 +110,29 @@ Recommended indexes:
 - `status`
 - `send_at`
 - `user_id`
-- `(status, send_at)` for worker polling or scheduled job lookup
 - `(event_type)` if list filtering by event type is expected to grow
+
+Outbox table: `notification_outbox`
+
+| Column            | Purpose                                       |
+|-------------------|-----------------------------------------------|
+| `notification_id` | Primary key and foreign key to notifications. |
+
+The outbox table does not need a separate ID or audit fields for v1. Its only purpose is to durably record that a notification still needs to be published to the queue.
 
 ### Queue System
 
-The queue decouples API write traffic from email delivery.
+The queue decouples outbox dispatch from email delivery.
 
 Required behavior:
 
-- Accept a job after `PUT /notifications/{id}` persists the notification.
+- Accept durable jobs from the outbox dispatcher.
 - Deliver jobs asynchronously to workers.
+- Support reliable acknowledgements so messages are not lost if a worker crashes before finishing processing.
 - Support delayed or scheduled execution if available.
 - Support retry-safe processing.
 
-If the selected queue supports delayed jobs, schedule jobs using `send_at` and retry delays directly in the queue. If it does not, the worker can requeue delayed jobs or periodically scan the database for due scheduled notifications.
+If the selected queue supports delayed jobs, the worker can use delayed messages for `send_at` and retry delays. If it does not, the worker can requeue delayed jobs or periodically scan the database for due scheduled notifications.
 
 For v1, prefer the simplest queue setup that can run in Docker and meet the required retry and scheduled delivery behavior.
 
@@ -158,10 +176,11 @@ Template rendering should happen inside the worker so API requests remain fast a
 ```text
 PUT /notifications/{id}
   -> validate request
-  -> insert notification with path id and status = scheduled
+  -> in one database transaction:
+       insert notification with path id and status = scheduled
+       insert notification_outbox row with the same id
   -> fail if a notification with the same id already exists
-  -> enqueue notification job
-  -> return { id, status }
+  -> return 202 - Accepted
 ```
 
 Default status for newly created notifications should be `scheduled`, even when `send_at` is immediate or omitted. The worker then transitions the record to `pending` when it starts a delivery attempt.
@@ -205,28 +224,11 @@ The architecture assumes this means three retries after the initial attempt:
 
 ## Consistency And Reliability
 
-### Persist Before Enqueue
+### Transactional Outbox
 
-The API service should insert the notification before creating the queue job. The queue job should contain only the notification ID, not the full email payload.
+The API service should insert the notification and its outbox row in the same database transaction. The queue job should contain only the notification ID, not the full email payload.
 
-This ensures the database remains the durable source of truth and avoids queue/database payload drift.
-
-### Transaction Boundary
-
-Preferred v1 approach:
-
-- Insert notification in a database transaction.
-- Commit the transaction.
-- Enqueue a job with the notification ID.
-
-Risk: if enqueue fails after commit, the notification remains stored but may not be processed.
-
-Mitigation options:
-
-- For the smallest v1, return an error if enqueue fails and leave the record visible for diagnosis.
-- Better production option: add an outbox table so notification creation and work scheduling are committed atomically, then have a dispatcher publish queue jobs.
-
-The outbox pattern is more reliable, but it adds moving parts. It should be considered if reliability is prioritized over v1 simplicity.
+The dispatcher publishes outbox rows to the queue and deletes each outbox row only after the queue confirms durable publish. This avoids the failure mode where the notification is stored but no queue job is ever created.
 
 ### Idempotency
 
@@ -243,31 +245,6 @@ Workers should use one of these strategies to avoid duplicate delivery:
 - Queue-level single-consumer guarantees combined with database status checks.
 
 The database status check should still exist even if the queue claims to deliver each job once.
-
-## Suggested Directory Boundaries
-
-The exact stack is not defined yet, so these are conceptual boundaries rather than language-specific package names.
-
-```text
-src/
-  api/              REST routes, request validation, response mapping
-  worker/           queue consumers and delivery orchestration
-  queue/            queue publisher and consumer integration
-  notifications/    notification domain logic and status transitions
-  email/            provider adapter and email sending contracts
-  templates/        template discovery and rendering logic
-  db/               database access and migrations integration
-templates/
-  email/
-    en/
-      WORKSHOP_REMINDER.subject.hbs
-      WORKSHOP_REMINDER.body.hbs
-migrations/
-docker-compose.yml
-README.md
-```
-
-Keep API service, worker, queue integration, templates, and migrations separated as the repo instructions require.
 
 ## API Design Notes
 
@@ -288,14 +265,7 @@ Validation should normalize or default:
 
 If a notification with the requested `id` already exists, return a failure and do not update the existing record. The recommended HTTP response is `409 Conflict`.
 
-Response status should match the specification:
-
-```json
-{
-  "id": "uuid",
-  "status": "scheduled"
-}
-```
+Successful response status: 202 - Accepted. No response body.
 
 ### `GET /notifications/{id}`
 
@@ -324,19 +294,19 @@ Add pagination in v1 even if not explicitly stated. Without pagination, this end
 
 Once a stack is chosen, local Docker should include at minimum:
 
-- API service container.
+- API + dispatcher service container.
 - Worker container.
 - Database container.
-- Queue container, unless using the database as the queue for v1.
+- Queue container.
 
 The documented startup command should come from the actual manifests added to the repo. Do not assume package manager, build command, or runtime until those files exist.
 
 ## Recommended V1 Build Order
 
-1. Define database migration for `notifications`.
+1. Define database migrations for `notifications` and `notification_outbox`.
 2. Implement notification domain model and status transitions.
-3. Implement `PUT /notifications/{id}` with insert-only persistence and duplicate-ID failure.
-4. Add queue publisher and worker consumer.
+3. Implement `PUT /notifications/{id}` with insert-only persistence, outbox insert, and duplicate-ID failure.
+4. Add outbox dispatcher and queue consumer.
 5. Add template loading and rendering with English fallback.
 6. Add email provider adapter with a local/dev fake provider.
 7. Implement retry scheduling and final failure state.
@@ -344,7 +314,7 @@ The documented startup command should come from the actual manifests added to th
 9. Add Docker-based local runtime.
 10. Add README setup and API examples.
 
-## Open Decisions Before Implementation
+## Tech Stack
 
 These should be decided before code is written:
 
@@ -356,17 +326,14 @@ These should be decided before code is written:
   - ?
 - Email provider.
   - ?
-- Whether API callers need idempotency keys for duplicate prevention.
 
 ## Minimal Recommended Architecture
 
 For the smallest production-shaped v1:
 
-- One API service process.
-- One worker process type, horizontally scalable.
+- One API + dispatcher service process.
+- One worker process, horizontally scalable.
 - One relational database for durable notification state.
 - One queue for async and delayed work.
 - Repository-based email templates.
 - Email provider isolated behind an adapter.
-
-This satisfies the current acceptance criteria while keeping optional endpoints and operational features out of the initial implementation path.

@@ -52,15 +52,7 @@ Behavior:
 - Stores notification in database
   - If record with given `id` already exists, return failure (do NOT overwrite)
 - Schedules background processing
-
-Response:
-
-```json
-{
-  "id": "uuid",
-  "status": "scheduled"
-}
-```
+- Returns `202 - Accepted` in case of success
 
 ---
 
