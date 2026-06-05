@@ -6,8 +6,6 @@ We are building a SaaS platform for managing online workshops and need a **Notif
 
 The service will integrate with our existing platform via **REST API**. It must be designed to be **reliable, scalable, and easy to extend**.
 
-The project is expected to be completed by a **Senior Backend Developer in approximately one week**.
-
 ---
 
 # Objectives
@@ -28,7 +26,7 @@ Build a backend service that:
 
 ### Create Notification
 
-`POST /notifications`
+`PUT /notifications/{id}`
 
 Example request:
 
@@ -50,6 +48,7 @@ Behavior:
 
 - Validates request
 - Stores notification in database
+  - If record with given `id` already exists, return failure (do NOT overwrite)
 - Schedules background processing
 
 Response:
@@ -73,7 +72,7 @@ Example response:
 {
   "id": "uuid",
   "status": "scheduled|pending|sent|failed",
-  "sent_at": "timestamp|null",
+  "updated_at": "timestamp|null",
   "retry_count": 0
 }
 ```
@@ -113,7 +112,7 @@ Example:
 template_key = event_type
 ```
 
-If a template for the requested locale does not exist, the service should **fallback to English (`en`)**.
+If a template for the requested locale does not exist, the service should **fall back to English (`en`)**.
 
 ---
 
@@ -125,8 +124,7 @@ Example structure:
 
 ```
 /templates/email/en/WORKSHOP_REMINDER.subject.hbs
-/templates/email/en/WORKSHOP_REMINDER.html.hbs
-/templates/email/en/WORKSHOP_REMINDER.text.hbs
+/templates/email/en/WORKSHOP_REMINDER.body.hbs
 ```
 
 Template engine can be chosen by the developer (Handlebars / Mustache / Jinja / etc.).
@@ -170,11 +168,11 @@ If email sending fails:
 
 Retry schedule:
 
-| Attempt | Delay |
-|------|------|
-| 1 | 1 minute |
-| 2 | 5 minutes |
-| 3 | 15 minutes |
+| Attempt | Delay      |
+|---------|------------|
+| 1       | 1 minute   |
+| 2       | 5 minutes  |
+| 3       | 15 minutes |
 
 After the third retry the notification status becomes **failed**.
 
@@ -266,20 +264,19 @@ Expected components:
 
 Table: `notifications`
 
-| column | type |
-|------|------|
-id | uuid |
-user_id | string |
-email | string |
-event_type | string |
-locale | string |
-payload | jsonb |
-status | string |
-send_at | timestamp |
-retry_count | integer |
-sent_at | timestamp |
-created_at | timestamp |
-updated_at | timestamp |
+| column      | type      |
+|-------------|-----------|
+| id          | uuid      |
+| user_id     | string    |
+| email       | string    |
+| event_type  | string    |
+| locale      | string    |
+| payload     | jsonb     |
+| status      | string    |
+| send_at     | timestamp |
+| retry_count | integer   |
+| created_at  | timestamp |
+| updated_at  | timestamp |
 
 Indexes:
 
