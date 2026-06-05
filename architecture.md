@@ -10,7 +10,7 @@ The design focuses on the required capabilities only:
 - Persist notifications in a database.
 - Process email delivery asynchronously.
 - Support scheduled delivery with `send_at` (optional, if omitted, deliver immediately).
-- Render repository-based Handlebars email templates.
+- Render repository-based email templates.
 - Retry failed sends using the required retry schedule.
 - Expose notification status through read endpoints.
 - Run locally with Docker once implementation manifests are added.
@@ -46,7 +46,8 @@ Responsibilities:
 - Publish a REST API.
 - Validate incoming requests.
 - Persist notification records.
-  - Only create new records, never update.
+  - Only create new records, never update existing records.
+  - Return a failure, preferably `409 Conflict`, if a notification with the requested `id` already exists.
 - Enqueue background work after successful persistence.
 - Return notification status and filtered notification lists.
 
@@ -91,7 +92,6 @@ Recommended fields based on the requirements:
 | `status`      | `scheduled`, `pending`, `sent`, or `failed`.      |
 | `send_at`     | Earliest delivery time.                           |
 | `retry_count` | Number of failed send attempts already recorded.  |
-| `sent_at`     | Timestamp set only after successful delivery.     |
 | `created_at`  | Creation timestamp.                               |
 | `updated_at`  | Last update timestamp.                            |
 
@@ -109,7 +109,7 @@ The queue decouples API write traffic from email delivery.
 
 Required behavior:
 
-- Accept a job after `POST /notifications` persists the notification.
+- Accept a job after `PUT /notifications/{id}` persists the notification.
 - Deliver jobs asynchronously to workers.
 - Support delayed or scheduled execution if available.
 - Support retry-safe processing.
@@ -135,7 +135,7 @@ This keeps the worker logic stable if the email provider changes later.
 
 Templates are repository files, selected by `event_type` and `locale`.
 
-Expected layout:
+Example layout:
 
 ```text
 templates/email/en/WORKSHOP_REMINDER.subject.hbs
@@ -156,14 +156,17 @@ Template rendering should happen inside the worker so API requests remain fast a
 ### Create Flow
 
 ```text
-POST /notifications
+PUT /notifications/{id}
   -> validate request
-  -> insert notification with status = scheduled
+  -> insert notification with path id and status = scheduled
+  -> fail if a notification with the same id already exists
   -> enqueue notification job
   -> return { id, status }
 ```
 
 Default status for newly created notifications should be `scheduled`, even when `send_at` is immediate or omitted. The worker then transitions the record to `pending` when it starts a delivery attempt.
+
+Create behavior is insert-only. A repeated request with an existing ID must not overwrite the stored notification.
 
 ### Delivery Flow
 
@@ -175,7 +178,7 @@ worker receives job
   -> atomically claim notification as pending
   -> render templates
   -> call email provider
-  -> on success: status = sent, sent_at = now
+  -> on success: status = sent
   -> on failure: retry or mark failed
 ```
 
@@ -193,14 +196,12 @@ Required retry schedule:
 
 After the third retry is exhausted, set status to `failed`.
 
-A practical interpretation is:
+The architecture assumes this means three retries after the initial attempt:
 
 - Initial attempt fails: increment `retry_count` to `1`, schedule next attempt after 1 minute.
 - Second failed attempt: increment `retry_count` to `2`, schedule next attempt after 5 minutes.
 - Third failed attempt: increment `retry_count` to `3`, schedule next attempt after 15 minutes.
 - Fourth failed attempt: mark `failed`.
-
-If the intended meaning is only three total attempts including the initial attempt, clarify this before implementation because the wording can be interpreted both ways.
 
 ## Consistency And Reliability
 
@@ -270,10 +271,11 @@ Keep API service, worker, queue integration, templates, and migrations separated
 
 ## API Design Notes
 
-### `POST /notifications`
+### `PUT /notifications/{id}`
 
 Validation should require:
 
+- `id` path parameter
 - `user_id`
 - `email`
 - `event_type`
@@ -282,7 +284,9 @@ Validation should require:
 Validation should normalize or default:
 
 - `locale`: default to `en` when absent.
-- `send_at`: default to immediate delivery when absent, if the product expects immediate notifications.
+- `send_at`: default to immediate delivery when absent.
+
+If a notification with the requested `id` already exists, return a failure and do not update the existing record. The recommended HTTP response is `409 Conflict`.
 
 Response status should match the specification:
 
@@ -295,7 +299,16 @@ Response status should match the specification:
 
 ### `GET /notifications/{id}`
 
-Return only public status fields required by the spec unless additional fields are explicitly needed.
+Return only public status fields required by the spec:
+
+```json
+{
+  "id": "uuid",
+  "status": "scheduled|pending|sent|failed",
+  "updated_at": "timestamp|null",
+  "retry_count": 0
+}
+```
 
 ### `GET /notifications`
 
@@ -322,7 +335,7 @@ The documented startup command should come from the actual manifests added to th
 
 1. Define database migration for `notifications`.
 2. Implement notification domain model and status transitions.
-3. Implement `POST /notifications` with persistence.
+3. Implement `PUT /notifications/{id}` with insert-only persistence and duplicate-ID failure.
 4. Add queue publisher and worker consumer.
 5. Add template loading and rendering with English fallback.
 6. Add email provider adapter with a local/dev fake provider.
@@ -343,7 +356,6 @@ These should be decided before code is written:
   - ?
 - Email provider.
   - ?
-- Whether retry count means three retries after the initial attempt or three total attempts.
 - Whether API callers need idempotency keys for duplicate prevention.
 
 ## Minimal Recommended Architecture
@@ -354,7 +366,7 @@ For the smallest production-shaped v1:
 - One worker process type, horizontally scalable.
 - One relational database for durable notification state.
 - One queue for async and delayed work.
-- Repository-based Handlebars templates.
+- Repository-based email templates.
 - Email provider isolated behind an adapter.
 
 This satisfies the current acceptance criteria while keeping optional endpoints and operational features out of the initial implementation path.

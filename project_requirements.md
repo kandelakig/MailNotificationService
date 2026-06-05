@@ -44,6 +44,8 @@ Example request:
 }
 ```
 
+`send_at` is optional. If omitted send immediately.
+
 Behavior:
 
 - Validates request
